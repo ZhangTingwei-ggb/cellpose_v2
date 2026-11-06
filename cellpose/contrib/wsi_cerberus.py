@@ -310,6 +310,7 @@ def _direct_tile_eval_process(
     min_size=15,
     diameter=None,
     bsize=256,
+    batch_size=8,
     tile_overlap=0.1,
     device=torch.device("cpu"),
 ):
@@ -362,7 +363,7 @@ def _direct_tile_eval_process(
     masks, flows, styles = model.eval(
         img, diameter=diameter, flow_threshold=flow_threshold,
         cellprob_threshold=cellprob_threshold, min_size=min_size,
-        tile_overlap=tile_overlap, bsize=bsize
+        tile_overlap=tile_overlap, bsize=bsize, batch_size=batch_size
     )
     # model.eval 返回 masks 2D
     _t_infer_e = time.perf_counter()
@@ -458,7 +459,7 @@ class CellposeWSI:
     def process_single_wsi_direct(self, wsi_path, output_path, mask_path=None,
                                    wsi_proc_mag=0.5, tile_shape=4096, chunk_shape=6000, ambiguous_size=64,
                                    flow_threshold=0.4, cellprob_threshold=0.0, min_size=15,
-                                   diameter=None, bsize=256, tile_overlap=0.1,
+                                   diameter=None, bsize=256, batch_size=8, tile_overlap=0.1,
                                    nr_post_proc_workers=0,
                                    patch_input_shape=512, patch_output_shape=512,
                                    cache_dir=None,
@@ -531,17 +532,27 @@ class CellposeWSI:
             except Exception:
                 pass
             # 完全自包含的 fallback，实现与 tiatoolbox 1.4.0 源码 1:1 一致
+            # （不用外层/全局的 PatchExtractor：外层函数在 use_cerberus_infer 分支内
+            # import 过同名变量，会导致内层闭包 NameError；这里用别名 + 纯 numpy 网格兜底）
             from collections import deque
             margin = np.array(cfg.margin)
             tile_shape = np.array(cfg.tile_shape)
             tile_shape = (np.floor(tile_shape / cfg.patch_output_shape) * cfg.patch_output_shape).astype(np.int32)
             image_shape = np.array(shape_xy)
-            (_, tile_outputs) = PatchExtractor.get_coordinates(
-                image_shape=image_shape,
-                patch_input_shape=tile_shape,
-                patch_output_shape=tile_shape,
-                stride_shape=tile_shape,
-            )
+            try:
+                from tiatoolbox.tools.patchextraction import PatchExtractor as _PE
+                (_, tile_outputs) = _PE.get_coordinates(
+                    image_shape=image_shape,
+                    patch_input_shape=tile_shape,
+                    patch_output_shape=tile_shape,
+                    stride_shape=tile_shape,
+                )
+            except Exception:
+                tw, th = int(tile_shape[0]), int(tile_shape[1])
+                _w, _h = int(image_shape[0]), int(image_shape[1])
+                _grid = [[x, y, min(x + tw, _w), min(y + th, _h)]
+                         for y in range(0, _h, th) for x in range(0, _w, tw)]
+                tile_outputs = np.array(_grid, dtype=np.int32)
             boxes = tile_outputs
             if np.all(image_shape <= tile_shape):
                 flag = np.zeros([boxes.shape[0], 4], dtype=np.int32)
@@ -665,7 +676,7 @@ class CellposeWSI:
                             continue
                     if img.size==0: continue
                     # cellpose per patch
-                    masks, flows, styles = self.model.eval(img, diameter=diameter, flow_threshold=flow_threshold, cellprob_threshold=cellprob_threshold, min_size=min_size, tile_overlap=tile_overlap, bsize=bsize)
+                    masks, flows, styles = self.model.eval(img, diameter=diameter, flow_threshold=flow_threshold, cellprob_threshold=cellprob_threshold, min_size=min_size, tile_overlap=tile_overlap, bsize=bsize, batch_size=batch_size)
                     # flows: [dP(2,H,W), cellprob(H,W)] or similar; fallback to zeros
                     try:
                         dP = flows[0]  # 2xHxW
@@ -738,7 +749,7 @@ class CellposeWSI:
                     t_tile = time.perf_counter()
                     new_dict, remove_list = _process_cellpose_tile(*args)
                 else:
-                    args = (ioconfig_pp, tile_bounds, tile_flag, set_idx, inst_dict, wsi_reader, self.model, resolution, flow_threshold, cellprob_threshold, min_size, diameter, bsize, tile_overlap, self.device)
+                    args = (ioconfig_pp, tile_bounds, tile_flag, set_idx, inst_dict, wsi_reader, self.model, resolution, flow_threshold, cellprob_threshold, min_size, diameter, bsize, batch_size, tile_overlap, self.device)
                     t_tile = time.perf_counter()
                     new_dict, remove_list = _direct_tile_eval_process(*args)
                     try:
@@ -912,7 +923,7 @@ class CellposeWSI:
     def process_wsi_list(self, wsi_list, output_dir, mask_list=None,
                          wsi_proc_mag=0.5, tile_shape=4096, chunk_shape=6000, ambiguous_size=64,
                          flow_threshold=0.4, cellprob_threshold=0.0, min_size=15,
-                         diameter=None, save_thumb=False, save_mask=False,
+                         diameter=None, batch_size=8, save_thumb=False, save_mask=False,
                          nr_post_proc_workers=0, logging_dir=None,
                          patch_input_shape=512, patch_output_shape=512, cache_dir=None,
                          save_viz_highres=False, viz_highres_tile=2048, viz_highres_mpp=None, viz_highres_max_tiles=16,
@@ -1069,7 +1080,7 @@ class CellposeWSI:
                 wsi_proc_mag=wsi_proc_mag, tile_shape=tile_shape,
                 ambiguous_size=ambiguous_size, flow_threshold=flow_threshold,
                 cellprob_threshold=cellprob_threshold, min_size=min_size,
-                diameter=diameter, nr_post_proc_workers=nr_post_proc_workers,
+                diameter=diameter, batch_size=batch_size, nr_post_proc_workers=nr_post_proc_workers,
                 save_viz_highres=save_viz_highres, viz_highres_tile=viz_highres_tile, viz_highres_mpp=viz_highres_mpp, viz_highres_max_tiles=viz_highres_max_tiles,
                 save_qupath=save_qupath, chunk_shape=chunk_shape, patch_input_shape=patch_input_shape, patch_output_shape=patch_output_shape, cache_dir=cache_dir, use_cerberus_infer=use_cerberus_infer
             )

@@ -36,10 +36,14 @@
   out_dir/viz/<IHC_stem>/<stem>_HEfused_full.tif  整张双色 BigTIFF（绿=IHC保留，红=HE补回）
   out_dir/viz/<IHC_stem>/<stem>_HEfused_preview.png 整张缩小预览图
   out_dir/viz_he/<HE_stem>/<stem>_HE_full.tif  HE 图 + HE 标注（需 --he_wsi_dir）
+  out_dir/viz_he/<HE_stem>/<stem>_fused_on_HE_full.tif  融合结果画在 HE 底上
+      （--on_he fused；IHC 配准图有黑边/视野不足时用这张看完整 HE 视野）
   out_dir/fuse_stats.csv               每对的 统计
 
  HE viz（--he_wsi 单对 / --he_wsi_dir 批量给了就画，--no_he_viz 关闭）：
   以 HE 原图为底图画 HE.dat 全量标注（红），与双色 viz 共用同一套分条带内核。
+  --on_he fused：把融合 dat 整体缩放到 HE 坐标系后画在 HE 底上，
+  绿=IHC 保留、红=HE 补回；不受 IHC 配准图黑边影响。
 """
 
 import argparse
@@ -265,9 +269,14 @@ def fuse_loaded(he_info, ihc_info, out_dat=None, iou_thresh=0.1, dist_thresh=25.
     return out, stats
 
 
-def _viz_overlay(wsi_path, info_or_dat, viz_dir, file_stem, color_of, viz_mpp=0.5, strip=2048):
-    """整图叠加内核：分条带读 WSI 基准层，画轮廓到整张 canvas，
-    存单张 BigTIFF（<file_stem>_full.tif）+ 一张小预览 PNG。color_of(entry) -> BGR 颜色。"""
+def _viz_overlay(wsi_path, info_or_dat, viz_dir, file_stem, color_of, viz_mpp=0.5, strip=2048,
+                 alpha_of=None, fill=False):
+    """整图叠加内核：分条带读 WSI 基准层，画轮廓/填充到整张 canvas，
+    存单张 BigTIFF（<file_stem>_full.tif）+ 一张小预览 PNG。
+
+    color_of(entry) -> BGR 颜色；alpha_of(entry) -> 填充透明度 0-1。
+    fill=False 时只画轮廓；fill=True 时先按 (颜色, alpha) 分组填充，再画轮廓。
+    """
     from tiatoolbox.wsicore.wsireader import WSIReader
     import tifffile
     info = joblib.load(info_or_dat) if isinstance(info_or_dat, str) else info_or_dat
@@ -277,14 +286,16 @@ def _viz_overlay(wsi_path, info_or_dat, viz_dir, file_stem, color_of, viz_mpp=0.
     proc_h, proc_w = [int(x) for x in np.array(info["proc_dimensions"]).ravel()[:2]]
     viz_w, viz_h = int(round(proc_w * scale)), int(round(proc_h * scale))
 
-    items = []  # (y0, y1, pts_full_int32, color_bgr)，pts 为整图 viz 坐标
+    items = []  # (y0, y1, pts_full_int32, color_bgr, alpha)，pts 为整图 viz 坐标
     for e in nuc.values():
         cnt = np.asarray(e["contour"], dtype=float) * scale
         color = color_of(e)
+        alpha = float(alpha_of(e)) if alpha_of is not None else 0.0
+        alpha = min(1.0, max(0.0, alpha))
         pts = np.round(cnt).astype(np.int32)
         pts[:, 0] = np.clip(pts[:, 0], 0, viz_w - 1)
         pts[:, 1] = np.clip(pts[:, 1], 0, viz_h - 1)
-        items.append((pts[:, 1].min(), pts[:, 1].max(), pts, color))
+        items.append((pts[:, 1].min(), pts[:, 1].max(), pts, color, alpha))
     # 轮廓按条带预分组：每条带只遍历与之相交的轮廓，避免 66k×13 次循环
     n_strips = (viz_h + strip - 1) // strip
     buckets = [[] for _ in range(n_strips)]
@@ -307,6 +318,10 @@ def _viz_overlay(wsi_path, info_or_dat, viz_dir, file_stem, color_of, viz_mpp=0.
         import zarr as _zarr
         _fh = _tf.TiffFile(wsi_path)
         _z = _zarr.open(_fh.aszarr(), mode="r")
+        if not hasattr(_z, "shape") and hasattr(_z, "keys"):
+            # OME aszarr 返回 Group（如天津 warped tiff），取最高分辨率层 '0'
+            _keys = list(_z.keys())
+            _z = _z["0"] if "0" in _keys else _z[_keys[0]]
         _bh, _bw = int(_z.shape[0]), int(_z.shape[1])
         if _z.ndim == 3 and _z.shape[0] == 3:  # 极少数 (C,H,W) 存储
             raise ValueError("unexpected CHW layout")
@@ -344,8 +359,28 @@ def _viz_overlay(wsi_path, info_or_dat, viz_dir, file_stem, color_of, viz_mpp=0.
         tile = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         oh, ow = tile.shape[:2]
         off = np.array([0, ty], dtype=np.int32)
-        for y0, y1, pts, color in buckets[si]:
-            cv2.polylines(tile, [pts - off], True, color, 1)
+        # 填充：同一 (颜色, alpha) 组只做一次 mask + 一次混合；
+        # 组内多边形重叠不会重复叠 alpha，避免颜色越叠越深。
+        if fill:
+            groups = {}
+            for y0, y1, pts, color, alpha in buckets[si]:
+                if alpha <= 0:
+                    continue
+                groups.setdefault((tuple(int(c) for c in color), alpha), []).append(pts - off)
+            for (color, alpha), polys in groups.items():
+                mask = np.zeros((oh, ow), dtype=np.uint8)
+                # 一次 fillPoly 画整组，避免 1.6M 次 Python->OpenCV 调用
+                cv2.fillPoly(mask, polys, 1)
+                m = mask.astype(bool)
+                if not m.any():
+                    continue
+                c = np.array(color, dtype=np.float32)
+                tile[m] = (tile[m].astype(np.float32) * (1.0 - alpha) + c * alpha).astype(np.uint8)
+        outlines = {}
+        for y0, y1, pts, color, alpha in buckets[si]:
+            outlines.setdefault(tuple(int(c) for c in color), []).append(pts - off)
+        for color, polys in outlines.items():
+            cv2.polylines(tile, polys, True, color, 1)
         canvas[ty:ty + oh, :ow] = tile
     try:
         if reader[0] == "zarr":
@@ -365,27 +400,147 @@ def _viz_overlay(wsi_path, info_or_dat, viz_dir, file_stem, color_of, viz_mpp=0.
     return tif_path
 
 
-def viz_dual(ihc_wsi, fused_dat_or_info, viz_dir, viz_mpp=0.5, strip=2048):
+def viz_dual(ihc_wsi, fused_dat_or_info, viz_dir, viz_mpp=0.5, strip=2048,
+             fill=False, alpha_he=0.5, alpha_ihc=0.8):
     """整张双色叠加：绿=IHC，红=HE（过滤模式是 HE 补回，direct_overlay 模式是 HE 全量）。
     底图为 IHC 配准图，分条带读取，存单张 BigTIFF + 一张小预览 PNG。"""
     stem = pathlib.Path(ihc_wsi).stem
     return _viz_overlay(ihc_wsi, fused_dat_or_info, viz_dir, f"{stem}_HEfused",
                         lambda e: (0, 255, 0) if e.get("source", "ihc") == "ihc" else (0, 0, 255),
-                        viz_mpp, strip)
+                        viz_mpp, strip,
+                        alpha_of=lambda e: alpha_ihc if e.get("source", "ihc") == "ihc" else alpha_he,
+                        fill=fill)
 
 
-def viz_he(he_wsi, he_dat_or_info, viz_dir, viz_mpp=0.5, strip=2048, color=(0, 0, 255)):
+def viz_he(he_wsi, he_dat_or_info, viz_dir, viz_mpp=0.5, strip=2048, color=(0, 0, 255),
+           fill=False, fill_alpha=0.5):
     """HE 图 + HE 标注单色叠加（默认红=HE 核，与双色图里的 HE 颜色一致）。
     底图为 HE 原图（.svs），用 HE.dat 自身的 proc/base 分辨率对齐，
     存单张 BigTIFF（<HE_stem>_HE_full.tif）+ 一张小预览 PNG。"""
     stem = pathlib.Path(he_wsi).stem
     return _viz_overlay(he_wsi, he_dat_or_info, viz_dir, f"{stem}_HE",
-                        lambda e: color, viz_mpp, strip)
+                        lambda e: color, viz_mpp, strip,
+                        alpha_of=lambda e: fill_alpha, fill=fill)
+
+
+def viz_ihc(ihc_wsi, ihc_dat_or_info, viz_dir, viz_mpp=0.5, strip=2048,
+            color=(0, 255, 0), fill=False, fill_alpha=0.8):
+    """IHC 图 + IHC 标注单色叠加（默认绿=IHC 核）。
+    底图为 IHC 配准图（*_warped.tiff），用 IHC.dat 自身的 proc/base 分辨率对齐，
+    存单张 BigTIFF（<IHC_stem>_IHC_full.tif）+ 一张小预览 PNG。"""
+    stem = pathlib.Path(ihc_wsi).stem
+    return _viz_overlay(ihc_wsi, ihc_dat_or_info, viz_dir, f"{stem}_IHC",
+                        lambda e: color, viz_mpp, strip,
+                        alpha_of=lambda e: fill_alpha, fill=fill)
+
+
+def _he_base_view(he_info, ihc_info, mode="both"):
+    """拼一个 HE 坐标系的合成 info，供 _viz_overlay 以 HE 为底图画图。
+
+    mode="ihc"：只含 IHC（缩放到 HE 坐标系，绿）；mode="both"：HE（红）+ IHC（绿）。
+    用原始 he/ihc info（不是 fused），direct_overlay 下即全量叠加。
+    """
+    if isinstance(he_info, str):
+        he_info = joblib.load(he_info)
+    if isinstance(ihc_info, str):
+        ihc_info = joblib.load(ihc_info)
+    hh, hw = _proc_dims(he_info)
+    ih, iw = _proc_dims(ihc_info)
+    sx = (hw / iw) if iw else 1.0  # IHC -> HE 缩放（与 fuse 里 HE->IHC 反方向）
+    sy = (hh / ih) if ih else 1.0
+    nuc = {}
+    if mode in ("both", "he"):
+        for k, e in he_info["Nuclei"].items():
+            c = {kk: (vv.copy() if isinstance(vv, np.ndarray) else vv) for kk, vv in e.items()}
+            c["source"] = "he"
+            nuc[uuid.uuid4().hex] = c
+    if mode in ("both", "ihc"):
+        for k, e in ihc_info["Nuclei"].items():
+            c = _scale_entry(e, sx, sy)
+            c["source"] = "ihc"
+            nuc[uuid.uuid4().hex] = c
+    return {"Nuclei": nuc,
+            "proc_resolution": he_info["proc_resolution"],
+            "base_resolution": he_info["base_resolution"],
+            "proc_dimensions": np.array(he_info["proc_dimensions"]),
+            "base_dimensions": np.array(he_info["base_dimensions"])}
+
+
+def viz_ihc_on_he(he_wsi, he_info, ihc_info, viz_dir, ihc_stem=None, viz_mpp=0.5, strip=2048,
+                  fill=False, fill_alpha=0.8):
+    """HE 为底 + 只画 IHC 标注（绿）。存 <ihc_stem>_on_HE_full.tif + preview。"""
+    view = _he_base_view(he_info, ihc_info, mode="ihc")
+    tag = ihc_stem or pathlib.Path(he_wsi).stem
+    return _viz_overlay(he_wsi, view, viz_dir, f"{tag}_on_HE",
+                        lambda e: (0, 255, 0), viz_mpp, strip,
+                        alpha_of=lambda e: fill_alpha, fill=fill)
+
+
+def viz_both_on_he(he_wsi, he_info, ihc_info, viz_dir, ihc_stem=None, viz_mpp=0.5, strip=2048,
+                   fill=False, alpha_he=0.5, alpha_ihc=0.8):
+    """HE 为底 + HE(红)+IHC(绿)同时画（两套全量标注，不做融合消除）。
+    存 <ihc_stem>_both_on_HE_full.tif + preview。"""
+    view = _he_base_view(he_info, ihc_info, mode="both")
+    tag = ihc_stem or pathlib.Path(he_wsi).stem
+    return _viz_overlay(he_wsi, view, viz_dir, f"{tag}_both_on_HE",
+                        lambda e: (0, 255, 0) if e.get("source") == "ihc" else (0, 0, 255),
+                        viz_mpp, strip,
+                        alpha_of=lambda e: alpha_ihc if e.get("source") == "ihc" else alpha_he,
+                        fill=fill)
+
+
+def _he_view_fused(he_info, fused_info):
+    """融合 dat（IHC proc 坐标）缩放到 HE proc 坐标系，保留 source 等字段。
+
+    IHC 配准图边缘常有黑边（moving 没盖满 fixed 视野），直接用 IHC 底画会
+    看起来被裁；以 HE 为底、把融合核整体缩放过来即可看到完整 HE 视野。
+    """
+    if isinstance(he_info, str):
+        he_info = joblib.load(he_info)
+    if isinstance(fused_info, str):
+        fused_info = joblib.load(fused_info)
+    hh, hw = _proc_dims(he_info)
+    ih, iw = _proc_dims(fused_info)
+    sx = (hw / iw) if iw else 1.0
+    sy = (hh / ih) if ih else 1.0
+    nuc = {k: _scale_entry(e, sx, sy) for k, e in fused_info["Nuclei"].items()}
+    return {"Nuclei": nuc,
+            "proc_resolution": he_info["proc_resolution"],
+            "base_resolution": he_info["base_resolution"],
+            "proc_dimensions": np.array(he_info["proc_dimensions"]),
+            "base_dimensions": np.array(he_info["base_dimensions"])}
+
+
+def viz_fused_on_he(he_wsi, he_info, fused_info, viz_dir, ihc_stem=None,
+                    viz_mpp=0.5, strip=2048, fill=False, alpha_he=0.5, alpha_ihc=0.8):
+    """HE 为底画融合结果（绿=IHC 保留，红=HE 补回）。
+
+    与 IHC 底的双色图互补：IHC 配准图有黑边/视野小于 HE 时，这张能看完整
+    HE 视野。存 <ihc_stem>_fused_on_HE_full.tif + preview。
+    """
+    view = _he_view_fused(he_info, fused_info)
+    tag = ihc_stem or pathlib.Path(he_wsi).stem
+    return _viz_overlay(he_wsi, view, viz_dir, f"{tag}_fused_on_HE",
+                        lambda e: (0, 255, 0) if e.get("source") == "ihc" else (0, 0, 255),
+                        viz_mpp, strip,
+                        alpha_of=lambda e: alpha_ihc if e.get("source") == "ihc" else alpha_he,
+                        fill=fill)
 
 
 def _pair_batch(dat_dir):
+    import re
     files = sorted(os.listdir(dat_dir))
     he = {f[:-len(" HE.dat")].strip(): f for f in files if f.endswith(" HE.dat")}
+    # 也接受 "2617860-2.dat" 这种 HE 命名（IHC 为 "2617860-E_warped.dat"）。
+    # 排除 IHC / 融合 / 阳性输出，避免把结果 dat 当成 HE。
+    for f in files:
+        if not f.endswith(".dat"):
+            continue
+        if (f.endswith("_warped.dat") or f.endswith("_HEfused.dat")
+                or f.endswith("_pos.dat") or f.startswith("RegProj_")
+                or "registered" in f or f.endswith(" HE.dat")):
+            continue
+        he.setdefault(pathlib.Path(f).stem, f)
     # IHC: "<caseID> <STAIN>_warped.dat"，如 "2519980 ER_warped.dat"，
     # caseID 即 HE 的 stem（如 "2519980"）。一张 HE 配 4 张 IHC，
     # 同一文件夹放多个 case 也能各自配上。
@@ -399,10 +554,34 @@ def _pair_batch(dat_dir):
             if prefix == stem or prefix.startswith(stem + " "):
                 if match is None or len(stem) > len(match):
                     match = stem
+        if match is None and len(he) == 1:
+            # 回退：目录里只有 1 个 HE（如 2615223_to_1-HE_1 HE.dat 配
+            # 2615223_to_1-IHC_*_warped.dat），默认全配给它
+            match = next(iter(he))
         if match is None:
             missing.append(prefix)
         else:
             pairs.append((prefix, he[match], f))
+    # 新命名：HE "2615223-1.dat"，IHC
+    # "RegProj_2615223-C_to_2615223-1-moving_to_fixed_registered.ome.dat"
+    # 编号 1/2/3/4 对应 C/E/K/P，按 fixed 编号配对
+    he2 = {}
+    for f in files:
+        m = re.match(r"^(.+)-(\d+)\.dat$", f)
+        if m and not f.startswith("RegProj_") and "registered" not in f:
+            he2[(m.group(1), m.group(2))] = f
+    for f in files:
+        if not f.endswith("registered.ome.dat"):
+            continue
+        m = re.match(r"^RegProj_(.+)-([A-Za-z]+)_to_(.+)-(\d+)-moving_to_fixed_registered\.ome\.dat$", f)
+        if not m:
+            continue
+        key = (m.group(3), m.group(4))
+        tag = f"{m.group(2)}_to_{key[0]}-{key[1]}"  # 如 C_to_2615223-1
+        if key in he2:
+            pairs.append((tag, he2[key], f))
+        else:
+            missing.append(tag)
     pairs.sort()
     return pairs, missing
 
@@ -437,10 +616,31 @@ def main():
     p.add_argument("--direct_overlay", action="store_true",
                    help="直接叠加：跳过 IoU/距离过滤，HE 全量 + IHC 全量合并")
     p.add_argument("--no_viz", action="store_true")
+    p.add_argument("--on_he", type=str, default="none",
+                   choices=["none", "ihc", "both", "fused", "all"],
+                   help="以 HE 为底额外画图：ihc=只画IHC(绿)，both=HE(红)+IHC(绿)，"
+                        "fused=融合结果(绿=IHC保留/红=HE补回)，all=三种都画；"
+                        "需 --he_wsi_dir/--he_wsi")
+    p.add_argument("--on_ihc", type=str, default="none",
+                   choices=["none", "ihc"],
+                   help="以 IHC 配准图为底额外画 IHC 标注：ihc=只画IHC(绿)；"
+                        "需 --ihc_wsi_dir/--ihc_wsi")
+    p.add_argument("--ihc_viz_dir", default=None,
+                   help="单对模式 IHC 底 IHC 标注输出目录，默认 --viz_dir")
+    p.add_argument("--fill", action="store_true",
+                   help="标注多边形填充（默认只画轮廓）")
+    p.add_argument("--he_fill_alpha", type=float, default=0.5,
+                   help="HE 标注填充透明度 0-1，默认 0.5")
+    p.add_argument("--ihc_fill_alpha", type=float, default=0.8,
+                   help="IHC 标注填充透明度 0-1，默认 0.8")
     p.add_argument("--viz_mpp", type=float, default=0.5)
     p.add_argument("--viz_strip", type=int, default=2048,
                    help="整图分条带读取高度（viz 像素），默认 2048")
     a = p.parse_args()
+    for _name in ("he_fill_alpha", "ihc_fill_alpha"):
+        _v = getattr(a, _name)
+        if not 0.0 <= _v <= 1.0:
+            p.error(f"--{_name} 必须在 0-1 之间，当前 {_v}")
 
     if a.dat_dir:  # 批量
         assert a.out_dir, "--dat_dir 需配 --out_dir"
@@ -450,6 +650,7 @@ def main():
         rows = []
         he_cache = {}  # 同一 HE.dat 只加载一次（1 个 HE 配多个 IHC 时省重复加载）
         he_viz_done = set()  # 已画过 HE viz 的 he_stem（每个 HE 只画一次）
+        he_wsi_cache = {}  # he_stem -> HE 图路径（None 表示找不到，避免重复查找）
         for n, (prefix, he_f, ihc_f) in enumerate(tqdm.tqdm(pairs, desc="Fuse batch", ncols=90), 1):
             ihc_stem = pathlib.Path(ihc_f).stem
             out_dat = os.path.join(dat_out, f"{ihc_stem}_HEfused.dat")
@@ -469,30 +670,60 @@ def main():
             ihc_info = joblib.load(ihc_path)
             print(f"[fuse] IHC loaded: n={len(ihc_info['Nuclei'])} "
                   f"({time.perf_counter() - t_ihc:.1f}s)", flush=True)
-            _, st = fuse_loaded(he_cache[he_path], ihc_info, out_dat,
-                                a.iou_thresh, a.dist_thresh, a.direct_overlay)
+            fused_info, st = fuse_loaded(he_cache[he_path], ihc_info, out_dat,
+                                         a.iou_thresh, a.dist_thresh, a.direct_overlay)
             st["prefix"] = prefix
             st["out"] = out_dat
             if not a.no_viz and a.ihc_wsi_dir:
                 wsi = _find_wsi(a.ihc_wsi_dir, [ihc_stem], (".tiff", ".tif", ".svs"))
                 if wsi:
                     viz_dual(wsi, out_dat, os.path.join(a.out_dir, "viz", ihc_stem),
-                             a.viz_mpp, a.viz_strip)
+                             a.viz_mpp, a.viz_strip, a.fill,
+                             a.he_fill_alpha, a.ihc_fill_alpha)
                 else:
                     print(f"[WARN] {ihc_stem}: IHC 图没找到，跳过 viz")
-            if not a.no_he_viz and a.he_wsi_dir:
-                he_stem = pathlib.Path(he_f).stem
+            if a.on_ihc == "ihc" and a.ihc_wsi_dir:
+                wsi = _find_wsi(a.ihc_wsi_dir, [ihc_stem], (".tiff", ".tif", ".svs"))
+                if wsi:
+                    viz_ihc(wsi, ihc_info, os.path.join(a.out_dir, "viz_ihc", ihc_stem),
+                            a.viz_mpp, a.viz_strip, fill=a.fill,
+                            fill_alpha=a.ihc_fill_alpha)
+                else:
+                    print(f"[WARN] {ihc_stem}: IHC 图没找到，跳过 IHC 底 viz")
+            elif a.on_ihc == "ihc":
+                print("[WARN] --on_ihc ihc 需给 --ihc_wsi_dir")
+            he_stem = pathlib.Path(he_f).stem
+            if a.he_wsi_dir and (not a.no_he_viz or a.on_he != "none") and he_stem not in he_wsi_cache:
+                cand = [he_stem] + ([he_stem[:-3]] if he_stem.endswith(" HE") else [])
+                he_wsi_cache[he_stem] = _find_wsi(a.he_wsi_dir, cand,
+                                                 (".svs", ".tiff", ".tif", ".mrxs", ".ndpi", ".scn"))
+                if he_wsi_cache[he_stem] is None:
+                    print(f"[WARN] {he_stem}: HE 图没找到，跳过 HE viz/on_he")
+            he_wsi_path = he_wsi_cache.get(he_stem)
+            if not a.no_he_viz and he_wsi_path:
                 if he_stem not in he_viz_done:
-                    cand = [he_stem] + ([he_stem[:-3]] if he_stem.endswith(" HE") else [])
-                    he_wsi = _find_wsi(a.he_wsi_dir, cand,
-                                       (".svs", ".tiff", ".tif", ".mrxs", ".ndpi", ".scn"))
-                    if he_wsi:
-                        viz_he(he_wsi, he_cache[he_path],
+                    viz_he(he_wsi_path, he_cache[he_path],
+                           os.path.join(a.out_dir, "viz_he", he_stem),
+                           a.viz_mpp, a.viz_strip, fill=a.fill,
+                           fill_alpha=a.he_fill_alpha)
+                    he_viz_done.add(he_stem)
+            if a.on_he in ("ihc", "all") and he_wsi_path:
+                viz_ihc_on_he(he_wsi_path, he_cache[he_path], ihc_info,
+                              os.path.join(a.out_dir, "viz_he", he_stem),
+                              ihc_stem, a.viz_mpp, a.viz_strip,
+                              fill=a.fill, fill_alpha=a.ihc_fill_alpha)
+            if a.on_he in ("both", "all") and he_wsi_path:
+                viz_both_on_he(he_wsi_path, he_cache[he_path], ihc_info,
                                os.path.join(a.out_dir, "viz_he", he_stem),
-                               a.viz_mpp, a.viz_strip)
-                        he_viz_done.add(he_stem)
-                    else:
-                        print(f"[WARN] {he_stem}: HE 图没找到，跳过 HE viz")
+                               ihc_stem, a.viz_mpp, a.viz_strip,
+                               fill=a.fill, alpha_he=a.he_fill_alpha,
+                               alpha_ihc=a.ihc_fill_alpha)
+            if a.on_he in ("fused", "all") and he_wsi_path:
+                viz_fused_on_he(he_wsi_path, he_cache[he_path], fused_info,
+                                os.path.join(a.out_dir, "viz_he", he_stem),
+                                ihc_stem, a.viz_mpp, a.viz_strip,
+                                fill=a.fill, alpha_he=a.he_fill_alpha,
+                                alpha_ihc=a.ihc_fill_alpha)
             rows.append(st)
             print(f"{prefix} [{st['mode']}]: HE={st['he_n']} IHC={st['ihc_n']} keep={st['kept_ihc']} "
                   f"drop={st['dropped_ihc']} supp={st['he_supplement']} fused={st['fused_n']} {st['secs']}s")
@@ -504,19 +735,52 @@ def main():
             print(f"stats -> {a.out_dir}/fuse_stats.csv")
     else:  # 单对
         assert a.he_dat and a.ihc_dat and a.out_dat, "单对模式需 --he_dat --ihc_dat --out_dat"
-        _, st = fuse_pair(a.he_dat, a.ihc_dat, a.out_dat, a.iou_thresh, a.dist_thresh,
-                          a.direct_overlay)
+        fused_info, st = fuse_pair(a.he_dat, a.ihc_dat, a.out_dat, a.iou_thresh, a.dist_thresh,
+                                   a.direct_overlay)
         print(f"[{st['mode']}] HE={st['he_n']} IHC={st['ihc_n']} keep={st['kept_ihc']} "
               f"drop={st['dropped_ihc']} supp={st['he_supplement']} fused={st['fused_n']} {st['secs']}s")
         print(f"fused -> {a.out_dat}")
         if not a.no_viz and a.ihc_wsi and a.viz_dir:
-            viz_dual(a.ihc_wsi, a.out_dat, a.viz_dir, a.viz_mpp, a.viz_strip)
+            viz_dual(a.ihc_wsi, a.out_dat, a.viz_dir, a.viz_mpp, a.viz_strip,
+                     a.fill, a.he_fill_alpha, a.ihc_fill_alpha)
+        if a.on_ihc == "ihc" and a.ihc_wsi:
+            ihc_viz_dir = a.ihc_viz_dir or a.viz_dir
+            if ihc_viz_dir:
+                viz_ihc(a.ihc_wsi, a.ihc_dat, ihc_viz_dir, a.viz_mpp, a.viz_strip,
+                        fill=a.fill, fill_alpha=a.ihc_fill_alpha)
+            else:
+                print("[WARN] 要画 IHC 底 viz 需给 --ihc_viz_dir（或 --viz_dir）")
+        elif a.on_ihc == "ihc":
+            print("[WARN] on_ihc 需给 --ihc_wsi")
         if not a.no_he_viz and a.he_wsi:
             he_viz_dir = a.he_viz_dir or a.viz_dir
             if he_viz_dir:
-                viz_he(a.he_wsi, a.he_dat, he_viz_dir, a.viz_mpp, a.viz_strip)
+                viz_he(a.he_wsi, a.he_dat, he_viz_dir, a.viz_mpp, a.viz_strip,
+                       fill=a.fill, fill_alpha=a.he_fill_alpha)
             else:
                 print("[WARN] 要画 HE viz 需给 --he_viz_dir（或 --viz_dir）")
+        if a.on_he != "none" and a.he_wsi:
+            he_viz_dir = a.he_viz_dir or a.viz_dir
+            if he_viz_dir:
+                _ihc_stem = pathlib.Path(a.ihc_dat).stem
+                if a.on_he in ("ihc", "all"):
+                    viz_ihc_on_he(a.he_wsi, a.he_dat, a.ihc_dat, he_viz_dir,
+                                  _ihc_stem, a.viz_mpp, a.viz_strip,
+                                  fill=a.fill, fill_alpha=a.ihc_fill_alpha)
+                if a.on_he in ("both", "all"):
+                    viz_both_on_he(a.he_wsi, a.he_dat, a.ihc_dat, he_viz_dir,
+                                   _ihc_stem, a.viz_mpp, a.viz_strip,
+                                   fill=a.fill, alpha_he=a.he_fill_alpha,
+                                   alpha_ihc=a.ihc_fill_alpha)
+                if a.on_he in ("fused", "all"):
+                    viz_fused_on_he(a.he_wsi, a.he_dat, fused_info, he_viz_dir,
+                                    _ihc_stem, a.viz_mpp, a.viz_strip,
+                                    fill=a.fill, alpha_he=a.he_fill_alpha,
+                                    alpha_ihc=a.ihc_fill_alpha)
+            else:
+                print("[WARN] on_he 需给 --he_viz_dir（或 --viz_dir）")
+        elif a.on_he != "none":
+            print("[WARN] on_he 需给 --he_wsi")
 
 
 if __name__ == "__main__":

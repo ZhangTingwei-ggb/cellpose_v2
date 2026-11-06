@@ -38,6 +38,7 @@ Cerberus 对齐（后处理拼块）：
   --chunk_shape INT        已废弃，direct 模式忽略，保留兼容 Cerberus  [default: 15000]
   --ambiguous_size INT     模糊边界宽度 px  [default: 64]  瓦片重叠去重的 margin
   --wsi_proc_mag FLOAT     处理 mpp  [default: 0.5]  0.5=20x，0.25=40x；程序自动处理无 mpp 的 TIFF
+  --assume_mpp FLOAT       强制指定 mpp（优先于 OME PhysicalSize）；不填自动读 OME，一般不用填
   --patch_input_shape INT  保留兼容  [default: 448]
   --patch_output_shape INT 保留兼容  [default: 144]
 
@@ -46,7 +47,8 @@ Cellpose 推理：
   --flow_threshold FLOAT   flow 误差阈值  [default: 0.4]  越大检出越多
   --cellprob_threshold FLOAT cellprob 阈值  [default: 0.0]  越小检出越多
   --min_size INT           最小面积过滤  [default: 15]
-  --batch_size INT         保留参数，direct 模式内部用 bsize=256  [default: 8]
+  --batch_size INT         每批同时送 GPU 的 256x256 patch 数  [default: 8]
+                           4090 + cpsam 实测 8/16/32 吞吐相同，调大只增显存，不建议超过 32
   --nr_post_proc_workers INT 后处理并行  [default: 0]  direct 模式建议 0（WSIReader 不可 pickle）
   --use_bfloat16           强制 bfloat16，默认 float32；4090 上 bfloat16 会触发 upsample_linear1d 崩溃
 
@@ -111,6 +113,80 @@ def _patched(*a, **kw):
     return _orig(*a, **kw)
 torch.load = _patched
 
+
+def _read_ome_mpp(path):
+    """从 OME-XML 读 PhysicalSizeX/Y（µm/px），读不到返回 None。"""
+    try:
+        import re, tifffile
+        with tifffile.TiffFile(path) as tf:
+            ome = tf.ome_metadata
+            if not ome:
+                return None
+            vals = []
+            for axis in ("X", "Y"):
+                m = re.search(rf'PhysicalSize{axis}="([0-9.eE+\-]+)"', ome)
+                vals.append(float(m.group(1)) if m else None)
+            if vals[0] and vals[1]:
+                return vals[0], vals[1]
+    except Exception:
+        pass
+    return None
+
+
+def _install_tiff_mpp_fallback(default_mpp=None):
+    """兼容 ResolutionUnit=NONE 的 OME-TIFF。
+
+    tiatoolbox 只读 TIFF 的 XResolution/ResolutionUnit，遇到
+    ResolutionUnit=NONE 会抛 ValueError: Invalid units: none，
+    即使 OME-XML 里已经写了 PhysicalSizeX/Y=0.5 也不会用。
+    这里在打开每个 WSI 前读一次 OME mpp，供 ppu2mpp 回退。
+    """
+    import tiatoolbox.utils.misc as tb_misc
+    from tiatoolbox.wsicore.wsireader import WSIReader
+
+    if getattr(WSIReader, "_mpp_fallback_installed", False):
+        return
+
+    state = {"mpp": default_mpp}
+    orig_ppu2mpp = tb_misc.ppu2mpp
+
+    def _ppu2mpp(ppu, units):
+        if str(units).lower() in ("none", "resunit.none") and state["mpp"]:
+            return float(state["mpp"])
+        return orig_ppu2mpp(ppu, units)
+
+    tb_misc.ppu2mpp = _ppu2mpp
+
+    orig_open = WSIReader.open
+    from tiatoolbox.wsicore.wsireader import TIFFWSIReader
+
+    def _open(input_img, *args, **kwargs):
+        if isinstance(input_img, (str, pathlib.Path)):
+            p = pathlib.Path(input_img)
+            if p.suffix.lower() in (".tif", ".tiff"):
+                try:
+                    import tifffile
+                    with tifffile.TiffFile(p) as tf:
+                        is_ome = tf.is_ome
+                except Exception:
+                    is_ome = False
+                if is_ome:
+                    m = _read_ome_mpp(p)
+                    mpp = default_mpp if default_mpp else (m[0] if m else None)
+                    state["mpp"] = mpp
+                    # OME-TIFF 用 TIFFWSIReader，能读金字塔层级；
+                    # OpenSlide 对 ResolutionUnit=NONE 的 OME-TIFF 会报错。
+                    if mpp:
+                        return TIFFWSIReader(input_img, mpp=(mpp, mpp))
+                    return TIFFWSIReader(input_img)
+        m = _read_ome_mpp(input_img) if isinstance(input_img, (str, pathlib.Path)) else None
+        state["mpp"] = default_mpp if default_mpp else (m[0] if m else None)
+        return orig_open(input_img, *args, **kwargs)
+
+    WSIReader.open = staticmethod(_open)
+    WSIReader._mpp_fallback_installed = True
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Cellpose WSI (Cerberus-style)")
     p.add_argument("--model", type=str, default="cpsam", help="Cellpose 模型：cpsam/cyto/cyto2/cyto3 或本地路径")
@@ -123,6 +199,8 @@ def parse_args():
     p.add_argument("--chunk_shape", type=int, default=15000, help="兼容 Cerberus, direct 模式忽略")
     p.add_argument("--ambiguous_size", type=int, default=64, help="模糊边界")
     p.add_argument("--wsi_proc_mag", type=float, default=0.5, help="处理 mpp")
+    p.add_argument("--assume_mpp", type=float, default=None,
+                   help="强制指定 TIFF 的 mpp（优先于 OME PhysicalSize）；不填则自动读 OME，一般不用填")
     p.add_argument("--patch_input_shape", type=int, default=448, help="兼容保留")
     p.add_argument("--patch_output_shape", type=int, default=144, help="兼容保留")
     p.add_argument("--diameter", type=float, default=None, help="Cellpose diameter, None 自动 (H&E 在 0.5mpp 建议 15-20)")
@@ -135,7 +213,7 @@ def parse_args():
     p.add_argument("--viz_highres_tile", type=int, default=2048, help="高分辨率分块边长 (像素)，默认 2048")
     p.add_argument("--viz_highres_mpp", type=float, default=None, help="高分辨率 mpp，默认用原图 base mpp (约 0.25)，越小越清晰")
     p.add_argument("--viz_highres_max_tiles", type=int, default=16, help="最多生成多少高分辨率小图，-1 不限，默认 16 均匀采样")
-    p.add_argument("--batch_size", type=int, default=8, help="cellpose eval batch")
+    p.add_argument("--batch_size", type=int, default=8, help="cellpose eval batch: 每批同时送 GPU 的 256x256 patch 数（4090+cpsam 实测 8/16/32 吞吐相同，调大只增显存）")
     p.add_argument("--nr_post_proc_workers", type=int, default=0, help="后处理并行 (direct 模式建议 0)")
     p.add_argument("--use_bfloat16", action="store_true", help="强制 bfloat16 (4090 上会触发 upsample bug，默认 float32)")
     return p.parse_args()
@@ -146,6 +224,7 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    _install_tiff_mpp_fallback(args.assume_mpp)
 
     wsi_files = sorted(glob.glob(f"{args.input_dir}/*{args.wsi_file_ext}"))
     if not wsi_files:
@@ -198,6 +277,7 @@ def main():
         cellprob_threshold=args.cellprob_threshold,
         min_size=args.min_size,
         diameter=args.diameter,
+        batch_size=args.batch_size,
         save_thumb=args.save_thumb,
         save_mask=args.save_mask,
         nr_post_proc_workers=args.nr_post_proc_workers,
